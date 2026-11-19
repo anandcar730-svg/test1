@@ -1,0 +1,6 @@
+{
+  "name": "my-plugin",
+  "version": "0.1.0",
+  "description": "A starter Claude Code plugin",
+  "author": { "name": "Your Name" }
+}
