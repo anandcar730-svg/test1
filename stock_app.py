@@ -243,6 +243,9 @@ def init_db():
         db.execute("ALTER TABLE app_users ADD COLUMN page_access TEXT")
     if "block_access" not in user_columns:
         db.execute("ALTER TABLE app_users ADD COLUMN block_access TEXT")
+    if "branch_access" not in user_columns:
+        # JSON list of branch ids a staff user may enter stock/sales for; NULL = every branch.
+        db.execute("ALTER TABLE app_users ADD COLUMN branch_access TEXT")
     if db.execute("SELECT COUNT(*) FROM branches").fetchone()[0] == 0:
         db.executemany("INSERT INTO branches (name) VALUES (?)",
                        [(n,) for n in DEFAULT_BRANCHES])
@@ -315,7 +318,7 @@ BLOCKS = (
     ("groups_editor", "Product Groups — editor"), ("groups_saved", "Product Groups — saved groups"),
     ("users_create", "Users — create account"), ("users_accounts", "Users — accounts"),
     ("userlog_status", "User Log — online / offline"), ("userlog_history", "User Log — sign-in history"),
-    ("users_assign_pages", "Users — page assignments"), ("users_assign_blocks", "Users — block assignments"),
+    ("users_assign_branches", "Users — branch assignments"), ("users_assign_pages", "Users — page assignments"), ("users_assign_blocks", "Users — block assignments"),
     ("settings_app", "Settings — app password"), ("settings_sales", "Settings — sales password"),
     ("settings_lock", "Settings — lock sales"), ("settings_forgot", "Settings — password help"),
 )
@@ -354,6 +357,35 @@ def allowed_blocks():
 
 def can_open_block(block):
     return block in allowed_blocks()
+
+
+def allowed_branch_ids():
+    """Branch ids the signed-in user may work in, or None for 'all branches'.
+    Read from the database on every request so an admin's change applies at once."""
+    if "allowed_bids" in g:
+        return g.allowed_bids
+    result = None
+    uid = session.get("user_id")
+    if uid and session.get("role") != "admin":
+        row = get_db().execute("SELECT branch_access FROM app_users WHERE id=?", (uid,)).fetchone()
+        if row and row["branch_access"]:
+            try:
+                ids = json.loads(row["branch_access"])
+                if isinstance(ids, list):
+                    result = {int(i) for i in ids}
+            except (TypeError, ValueError):
+                result = set()   # unreadable value: fail closed
+    g.allowed_bids = result
+    return result
+
+
+def can_use_branch(branch_id):
+    ids = allowed_branch_ids()
+    return ids is None or branch_id in ids
+
+
+def visible_branches():
+    return [b for b in all_branches() if can_use_branch(b["id"])]
 
 
 # ---------- Templates ----------
@@ -1130,13 +1162,14 @@ def picker_data():
     db = get_db()
     stockmap = {}
     for r in db.execute("SELECT * FROM stock"):
-        stockmap.setdefault(str(r["branch_id"]), {})[str(r["product_id"])] = fmt(r["qty"])
+        if can_use_branch(r["branch_id"]):
+            stockmap.setdefault(str(r["branch_id"]), {})[str(r["product_id"])] = fmt(r["qty"])
     products = all_products()
     return dict(
         stockmap=stockmap,
         unitmap={str(p["id"]): p["unit"] for p in products},
         productlist=picker_products(products),
-        branchmap={str(b["id"]): b["name"] for b in all_branches()},
+        branchmap={str(b["id"]): b["name"] for b in visible_branches()},
     )
 
 
@@ -1153,8 +1186,10 @@ def render(body_tpl, **ctx):
 def index():
     db = get_db()
     q = request.args.get("q", "").strip()
-    branches = all_branches()
-    sel_branch = request.args.get("branch", type=int) or (branches[0]["id"] if branches else None)
+    branches = visible_branches()
+    sel_branch = request.args.get("branch", type=int)
+    if sel_branch not in {b["id"] for b in branches}:
+        sel_branch = branches[0]["id"] if branches else None
 
     if q:
         like = f"%{q}%"
@@ -1200,6 +1235,9 @@ def move():
         bid = int(request.form["branch_id"])
     except (ValueError, KeyError):
         flash("Choose a branch.", "error")
+        return redirect(url_for("index"))
+    if not can_use_branch(bid):
+        flash("You are not assigned to that branch. Nothing was saved.", "error")
         return redirect(url_for("index"))
     note = request.form.get("note", "").strip()
     if kind not in ("IN", "OUT"):
@@ -1851,14 +1889,17 @@ def sales_page():
             d["n"] += 1; d["qty"] += r["qty"]
     debtor_list = [{"customer": k, **v} for k, v in sorted(debtors.items(), key=lambda kv: -kv[1]["qty"])]
 
-    branches = all_branches()
+    branches = visible_branches()
     products = all_products()
     stockmap = {}
     for r in db.execute("SELECT * FROM stock"):
-        stockmap.setdefault(str(r["branch_id"]), {})[str(r["product_id"])] = fmt(r["qty"])
+        if can_use_branch(r["branch_id"]):
+            stockmap.setdefault(str(r["branch_id"]), {})[str(r["product_id"])] = fmt(r["qty"])
     customers = [r[0] for r in db.execute(
         "SELECT DISTINCT customer FROM sales WHERE customer != '' ORDER BY customer")]
-    sel_branch = request.args.get("b", type=int) or (branches[0]["id"] if branches else None)
+    sel_branch = request.args.get("b", type=int)
+    if sel_branch not in {b["id"] for b in branches}:
+        sel_branch = branches[0]["id"] if branches else None
     sel_pay = request.args.get("p", "FREE")
     if sel_pay not in ("FREE", "CREDIT"):
         sel_pay = "FREE"
@@ -1892,6 +1933,9 @@ def add_sale():
         bid = int(request.form["branch_id"])
     except (ValueError, KeyError):
         flash("Choose a branch.", "error")
+        return redirect(url_for("sales_page"))
+    if not can_use_branch(bid):
+        flash("You are not assigned to that branch. Nothing was saved.", "error")
         return redirect(url_for("sales_page"))
     pay = request.form.get("pay_type", "FREE")
     customer = request.form.get("customer", "").strip()
@@ -4022,7 +4066,7 @@ ENDPOINT_PAGES = {
     "branches_page": "branches", "add_branch": "branches", "delete_branch": "branches",
     "userlog_page": "userlog",
     "users_page": "users", "users_add": "users", "users_toggle": "users",
-    "users_permissions": "users", "users_page_assignment": "users", "users_password": "users", "users_delete": "users",
+    "users_permissions": "users", "users_page_assignment": "users", "users_branch_assignment": "users", "users_password": "users", "users_delete": "users",
     "settings_page": "settings", "settings_password": "settings", "lock_sales": "settings",
 }
 
@@ -4040,7 +4084,7 @@ BLOCK_ENDPOINTS = {
     "lv_ignore": "loyverse_issues", "lv_unignore": "loyverse_issues",
     "lv_group_save": "groups_editor", "lv_group_delete": "groups_saved", "lv_add_products": "loyverse_issues",
     "users_add": "users_create", "users_toggle": "users_accounts", "users_permissions": "users_accounts",
-    "users_page_assignment": "users_assign_pages", "users_block_assignment": "users_assign_blocks",
+    "users_page_assignment": "users_assign_pages", "users_branch_assignment": "users_assign_branches", "users_block_assignment": "users_assign_blocks",
     "users_password": "users_accounts", "users_delete": "users_accounts",
     "lock_sales": "settings_lock",
 }
@@ -4270,7 +4314,7 @@ def gate():
     if not custom_page_access and role == "no_branch" and ep in branch_only:
         flash("You do not have permission to manage branches.", "error")
         return redirect(url_for("index"))
-    if not custom_page_access and role != "admin" and ep in {"userlog_page", "users_page", "users_add", "users_toggle", "users_permissions", "users_page_assignment", "users_password", "users_delete", "settings_page", "settings_password"}:
+    if not custom_page_access and role != "admin" and ep in {"userlog_page", "users_page", "users_add", "users_toggle", "users_permissions", "users_page_assignment", "users_branch_assignment", "users_password", "users_delete", "settings_page", "settings_password"}:
         flash("Only the software engineer account can manage users and settings.", "error")
         return redirect(url_for("sales_page" if role == "sales_only" else "index"))
     if role == "sales_only":
@@ -4426,6 +4470,9 @@ USERS_BODY = """
 <p><small>Choose any app pages now, or change them for any account below. Software engineer accounts always have full control.</small></p></div>{% endif %}
 {% if can_open_block('users_accounts') %}<div class="card"><h2>Accounts</h2><div class="scroll"><table><tr><th>Username</th><th>Access</th><th>Status</th><th>Action</th></tr>
 {% for u in users %}<tr><td>{{ u.username }}</td><td>{{ permission_labels(u) }}</td><td>{{ 'Active' if u.active else 'Disabled' }}</td><td><form method="post" action="{{ url_for('users_toggle', uid=u.id) }}"><button class="mini">{{ 'Disable' if u.active else 'Enable' }}</button></form></td></tr><tr><td colspan="4"><details><summary>Account options</summary><p><small>Saved passwords cannot be shown. Set a new password if it is forgotten.</small></p><form method="post" action="{{ url_for('users_permissions', uid=u.id) }}"><strong>Page access</strong><div class="page-grid">{% for key, label in page_options %}<label><input type="checkbox" name="pages" value="{{ key }}" {% if key in saved_pages(u) %}checked{% endif %}> {{ label }}</label>{% endfor %}</div><button class="mini">Save page access</button></form><form method="post" action="{{ url_for('users_password', uid=u.id) }}" class="row" style="margin-top:10px"><input name="password" type="password" placeholder="New password (6+ characters)" minlength="6" required><button class="mini">Set new password</button></form><form method="post" action="{{ url_for('users_delete', uid=u.id) }}" style="margin-top:10px" onsubmit="return confirm('Delete this account? This cannot be undone.');"><button class="del">Delete account</button></form></details></td></tr>{% else %}<tr><td colspan="4">No separate accounts yet. The current legacy password login has administrator access until accounts are created.</td></tr>{% endfor %}</table></div></div>{% endif %}
+{% if can_open_block('users_assign_branches') %}<div class="card"><h2>Branch assignment</h2><p><small>Choose which branch each staff user can enter stock and sales for. They will only see and use their own branches. Admins can always use every branch.</small></p>
+{% for u in assignable_users %}<form method="post" action="{{ url_for('users_branch_assignment') }}" style="margin:10px 0;padding:10px;border:1px solid #e2e8f0;border-radius:10px"><input type="hidden" name="user_id" value="{{ u.id }}"><strong>{{ u.username }}</strong>
+<div class="page-grid"><label><input type="checkbox" name="all" value="1" {% if saved_branches(u) is none %}checked{% endif %}> All branches</label>{% for b in all_branch_list %}<label><input type="checkbox" name="branch_ids" value="{{ b.id }}" {% if saved_branches(u) is not none and b.id in saved_branches(u) %}checked{% endif %}> {{ b.name }}</label>{% endfor %}</div><button class="mini">Save {{ u.username }}</button></form>{% else %}<small>Create a staff account first.</small>{% endfor %}</div>{% endif %}
 {% if can_open_block('users_assign_pages') %}<div class="card"><h2>Page assignments</h2><p><small>For each page, select all staff users who may open it. You can select more than one user.</small></p>{% for key, label in page_options %}<details style="margin:8px 0"><summary><strong>{{ label }}</strong> — choose users</summary><form method="post" action="{{ url_for('users_page_assignment') }}"><input type="hidden" name="page" value="{{ key }}"><div class="page-grid">{% for u in assignable_users %}<label><input type="checkbox" name="user_ids" value="{{ u.id }}" {% if key in saved_pages(u) %}checked{% endif %}> {{ u.username }}</label>{% else %}<small>Create a staff account first.</small>{% endfor %}</div><button class="mini">Save {{ label }} users</button></form></details>{% endfor %}</div>{% endif %}
 {% if can_open_block('users_assign_blocks') %}<div class="card"><h2>Block assignments</h2><p><small>Assign individual sections inside each page. For example, allow one user to use Stock In / Out and another user to see Stock by Branch.</small></p>{% for key, label in block_options %}<details style="margin:8px 0"><summary><strong>{{ label }}</strong> — choose users</summary><form method="post" action="{{ url_for('users_block_assignment') }}"><input type="hidden" name="block" value="{{ key }}"><div class="page-grid">{% for u in assignable_users %}<label><input type="checkbox" name="user_ids" value="{{ u.id }}" {% if key in saved_blocks(u) %}checked{% endif %}> {{ u.username }}</label>{% else %}<small>Create a staff account first.</small>{% endfor %}</div><button class="mini">Save {{ label }} users</button></form></details>{% endfor %}</div>{% endif %}
 """
@@ -4435,7 +4482,8 @@ def users_page():
     users = get_db().execute("SELECT * FROM app_users ORDER BY id").fetchall()
     return render(USERS_BODY, users=users, assignable_users=[u for u in users if u["role"] != "admin"],
                   page_options=USER_PAGES, block_options=BLOCKS, saved_pages=user_saved_pages,
-                  saved_blocks=user_saved_blocks, permission_labels=user_permission_labels)
+                  saved_blocks=user_saved_blocks, permission_labels=user_permission_labels,
+                  all_branch_list=all_branches(), saved_branches=user_saved_branches)
 
 
 def user_saved_pages(user):
@@ -4443,6 +4491,15 @@ def user_saved_pages(user):
     if pages is not None:
         return set(pages) & USER_PAGE_KEYS
     return LEGACY_PAGE_ACCESS.get(user["role"], USER_PAGE_KEYS if user["role"] == "admin" else set())
+
+
+def user_saved_branches(user):
+    """None = all branches, otherwise the set of assigned branch ids."""
+    try:
+        ids = json.loads(user["branch_access"]) if user["branch_access"] else None
+    except (TypeError, ValueError):
+        return set()
+    return {int(i) for i in ids} if isinstance(ids, list) else None
 
 
 def user_saved_blocks(user):
@@ -4589,6 +4646,30 @@ def users_page_assignment():
         db.execute("UPDATE app_users SET page_access=? WHERE id=?", (json.dumps(sorted(pages)), user["id"]))
     db.commit()
     flash("Users assigned to the selected page.")
+    return redirect(url_for("users_page"))
+
+
+@app.route("/users/branch-assignment", methods=["POST"])
+def users_branch_assignment():
+    """Admin decides which branches one staff user can enter stock/sales for."""
+    db = get_db()
+    user = db.execute("SELECT * FROM app_users WHERE id=?", (request.form.get("user_id", type=int),)).fetchone()
+    if not user or user["role"] == "admin":
+        flash("Account not found, or it is an admin account (admins use every branch).", "error")
+        return redirect(url_for("users_page"))
+    valid = {b["id"] for b in all_branches()}
+    if request.form.get("all"):
+        value, label = None, "all branches"
+    else:
+        ids = sorted({int(i) for i in request.form.getlist("branch_ids") if i.isdigit()} & valid)
+        if not ids:
+            flash("Tick at least one branch, or choose All branches. Nothing was changed.", "error")
+            return redirect(url_for("users_page"))
+        value = json.dumps(ids)
+        label = ", ".join(b["name"] for b in all_branches() if b["id"] in ids)
+    db.execute("UPDATE app_users SET branch_access=? WHERE id=?", (value, user["id"]))
+    db.commit()
+    flash(f"'{user['username']}' can now use: {label}.")
     return redirect(url_for("users_page"))
 
 
