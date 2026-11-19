@@ -719,7 +719,7 @@ window.ProductPicker = function(o){
       .then(function(r){return r.text();})
       .then(function(v){
         live.style.color = "#86efac"; live.textContent = "● live";
-        if (v !== cur && !busy()) location.reload();
+        if (v !== cur && !busy()) { saveScroll(); location.reload(); }
       })
       .catch(function(){ live.style.color = "#fca5a5"; live.textContent = "● offline"; });
   }
