@@ -1,0 +1,16 @@
+[Unit]
+Description=Stock Manager (Flask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/stock_app
+# Listen on localhost only; nginx is the public entrance.
+Environment=STOCK_HOST=127.0.0.1
+ExecStart=/usr/bin/python3 /opt/stock_app/stock_app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

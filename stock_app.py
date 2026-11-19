@@ -4748,4 +4748,4 @@ if __name__ == "__main__":
         sys.exit(0)
     threading.Thread(target=lv_loop, daemon=True).start()
     threading.Thread(target=backup_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    app.run(host=os.environ.get("STOCK_HOST", "0.0.0.0"), port=5001, debug=False)
