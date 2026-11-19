@@ -794,7 +794,7 @@ INDEX_BODY = """
 </div>
 {% if can_open_block('stock_summary') %}<div class="shop-branch-grid">
   {% for b in branches %}
-  {% if can_open_block('stock_move') %}<a class="shop-branch-card" href="#stock-in-out" data-branch-id="{{ b.id }}" aria-label="Open Stock In / Out for {{ b.name }}">{% else %}<div class="shop-branch-card">{% endif %}
+  {% if can_open_block('stock_move') and b.id in entry_ids %}<a class="shop-branch-card" href="#stock-in-out" data-branch-id="{{ b.id }}" aria-label="Open Stock In / Out for {{ b.name }}">{% else %}<div class="shop-branch-card">{% endif %}
     <div class="shop-branch-name">{{ b.name }}</div>
     <div class="shop-branch-number">{{ summary[b.id].units|fmt }}</div>
     <div class="shop-branch-caption">Total units available</div>
@@ -803,7 +803,7 @@ INDEX_BODY = """
       <div><span>Today OUT</span><strong class="r">−{{ summary[b.id].tout|fmt }}</strong></div>
     </div>
     {% if summary[b.id].low %}<span class="shop-low-alert">⚠ {{ summary[b.id].low }} low-stock item(s)</span>{% endif %}
-  {% if can_open_block('stock_move') %}</a>{% else %}</div>{% endif %}
+  {% if can_open_block('stock_move') and b.id in entry_ids %}</a>{% else %}</div>{% endif %}
   {% endfor %}
 </div>{% endif %}
 
@@ -816,7 +816,7 @@ INDEX_BODY = """
   <form method="post" action="{{ url_for('move') }}" id="mform" enctype="multipart/form-data" novalidate>
     <div class="step">1 · Branch</div>
     <select name="branch_id" id="mb" style="width:100%">
-      {% for b in branches %}<option value="{{ b.id }}" {{ 'selected' if b.id == sel_branch }}>{{ b.name }}</option>{% endfor %}
+      {% for b in entry_branches %}<option value="{{ b.id }}" {{ 'selected' if b.id == sel_branch }}>{{ b.name }}</option>{% endfor %}
     </select>
 
     <div class="step">2 · Tap the products (tap again to add one more)</div>
@@ -1186,10 +1186,12 @@ def render(body_tpl, **ctx):
 def index():
     db = get_db()
     q = request.args.get("q", "").strip()
-    branches = visible_branches()
+    branches = all_branches()            # everyone can SEE every branch's stock
+    entry_branches = visible_branches()  # but can only ENTER stock for assigned branches
+    entry_ids = {b["id"] for b in entry_branches}
     sel_branch = request.args.get("branch", type=int)
-    if sel_branch not in {b["id"] for b in branches}:
-        sel_branch = branches[0]["id"] if branches else None
+    if sel_branch not in entry_ids:
+        sel_branch = entry_branches[0]["id"] if entry_branches else None
 
     if q:
         like = f"%{q}%"
@@ -1223,7 +1225,8 @@ def index():
             summary[r["branch_id"]][key] = r["s"]
 
     stock_warnings = db.execute("SELECT * FROM lv_issues WHERE resolved=0 ORDER BY id DESC LIMIT 100").fetchall()
-    return render(INDEX_BODY, branches=branches, products=all_products(), rows=rows,
+    return render(INDEX_BODY, branches=branches, entry_branches=entry_branches, entry_ids=entry_ids,
+                  products=all_products(), rows=rows,
                   q=q, summary=summary, sel_branch=sel_branch, stock_warnings=stock_warnings, **picker_data())
 
 
