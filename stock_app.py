@@ -16,15 +16,17 @@ import os
 import secrets
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 from flask import (Flask, Response, flash, g, redirect, render_template_string,
-                   request, send_from_directory, session, url_for)
+                   request, send_file, send_from_directory, session, url_for)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -706,6 +708,7 @@ window.ProductPicker = function(o){
     {% if can_open_page('users') %}<a href="{{ url_for('users_page') }}">&#128101; Users</a>{% endif %}
     {% if can_open_page('userlog') %}<a href="{{ url_for('userlog_page') }}">&#128203; User Log</a>{% endif %}
     {% if can_open_page('settings') %}<a href="{{ url_for('settings_page') }}">&#9881; Settings</a>{% endif %}
+    {% if can_open_page('settings') %}<a href="{{ url_for('backups_page') }}">&#128190; Backup</a>{% endif %}
     <div class="sb-sep"></div>
     <div class="sb-logout"><a href="{{ url_for('logout') }}">&#128682; Log out</a></div>
   </div>
@@ -3359,13 +3362,14 @@ def lv_sync_once():
         LV_LOCK.release()
 
 
-def backup_db(keep=7):
-    """Once a day, write a consistent copy of the database and keep the newest few."""
+def backup_db(keep=14, manual=False):
+    """Write a consistent copy of the database (once a day automatically, any time by hand)."""
     folder = os.path.join(BASE_DIR, "backups")
     os.makedirs(folder, exist_ok=True)
-    target = os.path.join(folder, "stock_data-" + datetime.now().strftime("%Y-%m-%d") + ".db")
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S" if manual else "%Y-%m-%d")
+    target = os.path.join(folder, "stock_data-" + stamp + ".db")
     if os.path.exists(target):
-        return
+        return target
     src, dst = sqlite3.connect(DB_PATH, timeout=30), sqlite3.connect(target + ".tmp")
     try:
         src.backup(dst)
@@ -3375,6 +3379,7 @@ def backup_db(keep=7):
     os.replace(target + ".tmp", target)
     for old in sorted(f for f in os.listdir(folder) if f.endswith(".db"))[:-keep]:
         os.remove(os.path.join(folder, old))
+    return target
 
 
 def backup_loop():
@@ -4071,6 +4076,7 @@ ENDPOINT_PAGES = {
     "users_page": "users", "users_add": "users", "users_toggle": "users",
     "users_permissions": "users", "users_page_assignment": "users", "users_branch_assignment": "users", "users_password": "users", "users_delete": "users",
     "settings_page": "settings", "settings_password": "settings", "lock_sales": "settings",
+    "backups_page": "settings", "backup_create": "settings", "backup_full": "settings", "backup_file": "settings",
 }
 
 BLOCK_ENDPOINTS = {
@@ -4317,7 +4323,7 @@ def gate():
     if not custom_page_access and role == "no_branch" and ep in branch_only:
         flash("You do not have permission to manage branches.", "error")
         return redirect(url_for("index"))
-    if not custom_page_access and role != "admin" and ep in {"userlog_page", "users_page", "users_add", "users_toggle", "users_permissions", "users_page_assignment", "users_branch_assignment", "users_password", "users_delete", "settings_page", "settings_password"}:
+    if not custom_page_access and role != "admin" and ep in {"userlog_page", "users_page", "users_add", "users_toggle", "users_permissions", "users_page_assignment", "users_branch_assignment", "users_password", "users_delete", "settings_page", "settings_password", "backups_page", "backup_create", "backup_full", "backup_file"}:
         flash("Only the software engineer account can manage users and settings.", "error")
         return redirect(url_for("sales_page" if role == "sales_only" else "index"))
     if role == "sales_only":
@@ -4835,6 +4841,96 @@ def export_csv():
     span = f"{f['from'] or 'start'}_to_{f['to'] or 'today'}"
     return Response(buf.getvalue(), mimetype="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f"attachment; filename=stock_history_{span}.csv"})
+
+
+# ---------- Backups: save a copy on the server, or download everything ----------
+BACKUPS_BODY = """
+<div class="card">
+  <h2>Download a full backup</h2>
+  <p style="margin:0 0 10px">One zip file with the <strong>database</strong> (all stock, sales, users, history) and all <strong>product photos</strong>. Keep it somewhere safe, such as your phone or Google Drive.</p>
+  <a href="{{ url_for('backup_full') }}" style="display:inline-block;background:#3157d5;color:#fff;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:700">&#11015; Download full backup (.zip)</a>
+  <p><small>The zip does not include loyverse_config.json, because it holds your Loyverse access tokens. Keep a private copy of that file yourself.</small></p>
+</div>
+<div class="card">
+  <h2>Backups kept on the server</h2>
+  <form method="post" action="{{ url_for('backup_create') }}" style="margin-bottom:12px"><button>Save a backup copy now</button></form>
+  <div class="scroll"><table>
+    <tr><th>File</th><th class="n">Size</th><th>Saved</th><th></th></tr>
+    {% for f in files %}<tr><td>{{ f.name }}</td><td class="n">{{ f.size }}</td><td>{{ f.when }}</td><td><a href="{{ url_for('backup_file', name=f.name) }}">Download</a></td></tr>
+    {% else %}<tr><td colspan="4">No backups yet.</td></tr>{% endfor %}
+  </table></div>
+  <small>A copy is saved automatically once a day. The newest 14 are kept. These copies sit on the same server, so also download one now and then.</small>
+</div>
+<div class="card"><h2>How to restore</h2>
+  <p style="margin:0">Ask your software engineer, or: stop the app (<code>sudo systemctl stop stock-app</code>), put the backup's <code>stock_data.db</code> in the app folder, copy the photos back into <code>product_photos/</code>, and start it again (<code>sudo systemctl start stock-app</code>). Delete any old <code>stock_data.db-wal</code> and <code>stock_data.db-shm</code> files first.</p>
+</div>
+"""
+
+
+def backup_files():
+    folder = os.path.join(BASE_DIR, "backups")
+    out = []
+    if os.path.isdir(folder):
+        for name in sorted(os.listdir(folder), reverse=True):
+            if name.endswith(".db"):
+                st = os.stat(os.path.join(folder, name))
+                out.append({"name": name, "size": f"{st.st_size / 1024 / 1024:.1f} MB" if st.st_size > 1048576 else f"{max(1, st.st_size // 1024)} KB",
+                            "when": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")})
+    return out
+
+
+@app.route("/backups")
+def backups_page():
+    return render(BACKUPS_BODY, files=backup_files())
+
+
+@app.route("/backups/create", methods=["POST"])
+def backup_create():
+    try:
+        backup_db(manual=True)
+        flash("Backup copy saved on the server.")
+    except Exception as e:
+        flash(f"Backup failed: {e}", "error")
+    return redirect(url_for("backups_page"))
+
+
+@app.route("/backups/file/<name>")
+def backup_file(name):
+    folder = os.path.join(BASE_DIR, "backups")
+    if os.path.basename(name) != name or not name.startswith("stock_data-") or not name.endswith(".db"):
+        flash("That backup was not found.", "error")
+        return redirect(url_for("backups_page"))
+    return send_from_directory(folder, name, as_attachment=True)
+
+
+@app.route("/backups/full.zip")
+def backup_full():
+    """Zip of a consistent database snapshot plus every product photo."""
+    fd, zip_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    snap = zip_path + ".db"
+    src, dst = sqlite3.connect(DB_PATH, timeout=30), sqlite3.connect(snap)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(snap, "stock_data.db")
+            if os.path.isdir(PHOTO_DIR):
+                for name in os.listdir(PHOTO_DIR):
+                    path = os.path.join(PHOTO_DIR, name)
+                    if os.path.isfile(path):
+                        z.write(path, "product_photos/" + name)
+            z.writestr("README.txt", "Stock Manager full backup.\nstock_data.db = database, product_photos/ = pictures.\n"
+                       "To restore: stop the app, put stock_data.db and product_photos/ in the app folder, start the app.\n")
+    finally:
+        os.remove(snap)
+    resp = send_file(zip_path, as_attachment=True,
+                     download_name="stock-backup-" + datetime.now().strftime("%Y-%m-%d_%H%M") + ".zip")
+    resp.call_on_close(lambda: os.path.exists(zip_path) and os.remove(zip_path))
+    return resp
 
 
 if __name__ == "__main__":
