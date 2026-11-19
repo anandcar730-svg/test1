@@ -2852,29 +2852,37 @@ def lv_get(cfg, path, params=None):
     url = cfg["base_url"] + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    for attempt in range(3):
+    last = "Loyverse is busy. Try again in a minute."
+    for attempt in range(4):
         req = urllib.request.Request(url, headers={
             "Authorization": "Bearer " + cfg["token"], "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 2:
-                try:
-                    wait = int(e.headers.get("Retry-After") or 5)
-                except ValueError:
-                    wait = 5
-                time.sleep(min(wait, 30))
-                continue
             if e.code in (401, 403):
                 raise LoyverseError(f"Loyverse refused the access token (HTTP {e.code}). "
                                     "Check the token in loyverse_config.json.")
+            if e.code == 429 or e.code >= 500:      # temporary: wait and retry
+                last = f"Loyverse returned a temporary error (HTTP {e.code})."
+                try:
+                    wait = int(e.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    wait = 0
+                if attempt < 3:
+                    time.sleep(min(wait or 2 ** (attempt + 1), 30))
+                    continue
+                break
             raise LoyverseError(f"Loyverse returned an error (HTTP {e.code}).")
-        except urllib.error.URLError as e:
-            raise LoyverseError(f"Could not reach Loyverse: {e.reason}")
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last = f"Could not reach Loyverse: {getattr(e, 'reason', e)}"
+            if attempt < 3:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            break
         except (ValueError, OSError):
             raise LoyverseError("Loyverse sent a reply that could not be read.")
-    raise LoyverseError("Loyverse is busy. Try again in a minute.")
+    raise LoyverseError(last)
 
 
 def db_conn():
@@ -3249,7 +3257,17 @@ def lv_sync_once():
                         _saved[cid] = lv_save_customer(db, cid, _raw[cid]) if _raw.get(cid) else ""
                     return _saved[cid]
                 for receipt in receipts:
-                    total_applied += lv_process_receipt(db, cfg, receipt, store_map, start_from, getcust, account_id)
+                    try:
+                        total_applied += lv_process_receipt(db, cfg, receipt, store_map, start_from, getcust, account_id)
+                    except LoyverseError:
+                        raise
+                    except Exception as e:     # isolate one bad receipt; the rest still sync
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                        print("Loyverse receipt problem:", receipt.get("receipt_number"), e)
+                        account_errors.append(f"{cfg['name']}: receipt {receipt.get('receipt_number')} failed ({e})")
             except LoyverseError as e:
                 account_errors.append(f"{cfg['name']}: {e}")
         # Do not advance the shared cursor if any account failed; successful accounts are
@@ -3277,7 +3295,35 @@ def lv_sync_once():
         LV_LOCK.release()
 
 
+def backup_db(keep=7):
+    """Once a day, write a consistent copy of the database and keep the newest few."""
+    folder = os.path.join(BASE_DIR, "backups")
+    os.makedirs(folder, exist_ok=True)
+    target = os.path.join(folder, "stock_data-" + datetime.now().strftime("%Y-%m-%d") + ".db")
+    if os.path.exists(target):
+        return
+    src, dst = sqlite3.connect(DB_PATH, timeout=30), sqlite3.connect(target + ".tmp")
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    os.replace(target + ".tmp", target)
+    for old in sorted(f for f in os.listdir(folder) if f.endswith(".db"))[:-keep]:
+        os.remove(os.path.join(folder, old))
+
+
+def backup_loop():
+    while True:
+        try:
+            backup_db()
+        except Exception as e:
+            print("Backup problem:", e)
+        time.sleep(3600)
+
+
 def lv_loop():
+    failures = 0
     while True:
         wait = 60
         try:
@@ -3285,13 +3331,18 @@ def lv_loop():
             if cfgs and not (isinstance(cfgs, dict) and cfgs.get("error")):
                 wait = cfgs[0]["interval"]
                 db = db_conn()
-                on = setting_get(db, "lv_enabled") == "1"
-                db.close()
+                try:
+                    on = setting_get(db, "lv_enabled") == "1"
+                finally:
+                    db.close()
                 if on:
-                    lv_sync_once()
+                    ok, _msg = lv_sync_once()
+                    failures = 0 if ok else failures + 1
         except Exception as e:
+            failures += 1
             print("Loyverse loop problem:", e)
-        time.sleep(wait)
+        # Back off (up to 10 minutes) while Loyverse or the network keeps failing.
+        time.sleep(min(wait * (2 ** min(failures, 4)) if failures else wait, 600))
 
 
 LOYVERSE_BODY = """
@@ -4696,4 +4747,5 @@ if __name__ == "__main__":
         print("Passwords cleared. Start the app and open it to choose new passwords.")
         sys.exit(0)
     threading.Thread(target=lv_loop, daemon=True).start()
+    threading.Thread(target=backup_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5001, debug=False)
