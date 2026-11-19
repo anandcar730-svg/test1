@@ -703,6 +703,23 @@ window.ProductPicker = function(o){
     if(h && (cur===h || (h!=="/" && cur.startsWith(h)))) a.classList.add("cur");
   });
 })();
+/* Keep the scroll position after a form is submitted (page reloads), so phone users
+   are not thrown back to the top every time they press OK. */
+function saveScroll(){
+  try { sessionStorage.setItem("scroll:" + location.pathname, String(window.scrollY || 0)); } catch(e){}
+}
+(function(){
+  document.addEventListener("submit", saveScroll, true);
+  function restore(){
+    if (location.hash) return;
+    var y = null;
+    try { y = sessionStorage.getItem("scroll:" + location.pathname); sessionStorage.removeItem("scroll:" + location.pathname); } catch(e){}
+    y = parseInt(y, 10);
+    if (y > 0) { window.scrollTo(0, y); setTimeout(function(){ window.scrollTo(0, y); }, 250); }
+  }
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restore); else restore();
+})();
 (function(){
   var cur = {{ version|tojson }}, live = document.getElementById("live");
   function busy(){
